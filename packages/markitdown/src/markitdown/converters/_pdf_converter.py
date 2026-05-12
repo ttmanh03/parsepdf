@@ -2,6 +2,7 @@ import sys
 import io
 import re
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import BinaryIO, Any
 
 from .._base_converter import DocumentConverter, DocumentConverterResult
@@ -738,9 +739,10 @@ class PdfConverter(DocumentConverter):
     Falls back to pdfminer if pdfplumber is missing or fails.
     """
 
-    def __init__(self, *, llm_client: Any = None, llm_model: str | None = None) -> None:
+    def __init__(self, *, llm_client: Any = None, llm_model: str | None = None, max_workers: int = 10) -> None:
         self._llm_client = llm_client
         self._llm_model = llm_model
+        self._max_workers = max_workers
 
     def accepts(
         self,
@@ -760,39 +762,59 @@ class PdfConverter(DocumentConverter):
 
         return False
 
-    def _ocr_page_with_llm(self, page: Any) -> str | None:
-        """Render page to image and extract text/tables via LLM vision API."""
-        try:
-            page_img = page.to_image(resolution=150)
-            img_stream = io.BytesIO()
-            page_img.original.save(img_stream, format="PNG")
-            b64 = base64.b64encode(img_stream.getvalue()).decode("utf-8")
-            data_uri = f"data:image/png;base64,{b64}"
+    def _page_has_chart(self, page: Any) -> bool:
+        """Return True if the page likely contains a chart or figure."""
+        page_area = float(page.width) * float(page.height)
+        if page_area == 0:
+            return False
+        # Raster images covering more than 15% of the page
+        if page.images:
+            img_area = sum(
+                (float(img["x1"]) - float(img["x0"])) * (float(img["y1"]) - float(img["y0"]))
+                for img in page.images
+            )
+            if img_area / page_area > 0.15:
+                return True
+        # Many Bezier curves typically indicate a vector chart (e.g. matplotlib output)
+        if len(getattr(page, "curves", [])) > 50:
+            return True
+        return False
 
+    def _call_llm_with_image(self, png_bytes: bytes, page_idx: int, has_chart: bool = False) -> tuple[int, str | None]:
+        """Send pre-rendered PNG bytes to LLM and return (page_idx, markdown)."""
+        if has_chart:
+            prompt = (
+                "Extract all text and tables from this image normally. "
+                "For any chart, graph, or figure: do NOT attempt to recreate it as a table. "
+                "Instead, write a concise markdown description covering its type "
+                "(bar/line/scatter/pie/etc.), axes labels, legend, and key trends or values. "
+                "Preserve reading order. Return ONLY the extracted content."
+            )
+        else:
+            prompt = (
+                "Extract all text and tables from this image. "
+                "Format tables as Markdown tables using | separators "
+                "and a --- header divider row. "
+                "Preserve reading order. Return ONLY the extracted content."
+            )
+        try:
+            data_uri = "data:image/png;base64," + base64.b64encode(png_bytes).decode("utf-8")
             response = self._llm_client.chat.completions.create(
                 model=self._llm_model,
                 messages=[
                     {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Extract all text and tables from this image. "
-                                    "Format tables as Markdown tables using | separators "
-                                    "and a --- header divider row. "
-                                    "Preserve reading order. Return ONLY the extracted content."
-                                ),
-                            },
+                            {"type": "text", "text": prompt},
                             {"type": "image_url", "image_url": {"url": data_uri}},
                         ],
                     }
                 ],
             )
             text = response.choices[0].message.content
-            return text.strip() if text else None
+            return page_idx, text.strip() if text else None
         except Exception:
-            return None
+            return page_idx, None
 
     def convert(
         self,
@@ -816,55 +838,40 @@ class PdfConverter(DocumentConverter):
         # Read file stream into BytesIO for compatibility with pdfplumber
         pdf_bytes = io.BytesIO(file_stream.read())
 
+        if self._llm_client is None:
+            raise ValueError(
+                "llm_client is required for PDF conversion. "
+                "Pass llm_client and llm_model when constructing PdfConverter."
+            )
+
         try:
-            # Single pass: check every page for form-style content.
-            # Pages with tables/forms get rich extraction; plain-text
-            # pages are collected separately. page.close() is called
-            # after each page to free pdfplumber's cached objects and
-            # keep memory usage constant regardless of page count.
-            markdown_chunks: list[str] = []
-            form_page_count = 0
-            plain_page_indices: list[int] = []
-
+            # Step 1: render all pages to PNG bytes and detect charts (sequential, fast)
+            page_images: list[bytes] = []
+            chart_flags: list[bool] = []
             with pdfplumber.open(pdf_bytes) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
-                    page_content = _extract_form_content_from_words(page)
+                for page in pdf.pages:
+                    chart_flags.append(self._page_has_chart(page))
+                    buf = io.BytesIO()
+                    page.to_image(resolution=150).original.save(buf, format="PNG")
+                    page_images.append(buf.getvalue())
+                    page.close()
 
-                    if page_content is not None:
-                        form_page_count += 1
-                        if self._llm_client is not None:
-                            # Table detected — use LLM vision for accurate extraction
-                            llm_result = self._ocr_page_with_llm(page)
-                            chunk = llm_result if llm_result else page_content
-                        else:
-                            chunk = page_content
-                        if chunk.strip():
-                            markdown_chunks.append(chunk)
-                    else:
-                        plain_page_indices.append(page_idx)
-                        text = page.extract_text()
-                        if text and text.strip():
-                            markdown_chunks.append(text.strip())
+            # Step 2: send all pages to LLM concurrently, preserve order
+            results: list[str | None] = [None] * len(page_images)
+            workers = min(self._max_workers, len(page_images))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(self._call_llm_with_image, img, idx, chart_flags[idx]): idx
+                    for idx, img in enumerate(page_images)
+                }
+                for future in as_completed(futures):
+                    idx, result = future.result()
+                    results[idx] = result
 
-                    page.close()  # Free cached page data immediately
-
-            # If no pages had form-style content, use pdfminer for
-            # the whole document (better text spacing for prose).
-            if form_page_count == 0:
-                pdf_bytes.seek(0)
-                markdown = pdfminer.high_level.extract_text(pdf_bytes)
-            else:
-                markdown = "\n\n".join(markdown_chunks).strip()
+            markdown = "\n\n".join(r for r in results if r and r.strip()).strip()
 
         except Exception:
-            # Fallback if pdfplumber fails
-            pdf_bytes.seek(0)
-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
-
-        # Fallback if still empty
-        if not markdown:
-            pdf_bytes.seek(0)
-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
+            markdown = ""
 
         # Post-process to merge MasterFormat-style partial numbering with following text
         markdown = _merge_partial_numbering_lines(markdown)
